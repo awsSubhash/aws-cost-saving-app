@@ -1,7 +1,3 @@
-// server.js - Backend using Node.js, Express, and AWS SDK v3
-// Handles API routes to fetch AWS resources, determine status, and estimate costs
-// Updated: Added node-cron for daily scheduled scans and automatic emails
-
 require('dotenv').config();
 const express = require('express');
 const nodemailer = require('nodemailer');
