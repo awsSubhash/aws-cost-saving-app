@@ -1,10 +1,11 @@
 // server.js - Backend using Node.js, Express, and AWS SDK v3
 // Handles API routes to fetch AWS resources, determine status, and estimate costs
-// Updated: Fixed Service and Region columns in /api/resources for 'all' case
+// Updated: Added node-cron for daily scheduled scans and automatic emails
 
 require('dotenv').config();
 const express = require('express');
 const nodemailer = require('nodemailer');
+const cron = require('node-cron'); // Added for scheduling
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -135,7 +136,7 @@ async function sendNotification(resources, isManual = false) {
   const body = resources.length 
     ? `The following AWS resources were identified:\n\n` +
       resources.map(r => `${r.service.toUpperCase()} in ${r.region}: ${r.id || r.name} (${r.usageStatus}, Cost: $${r.monthlyCost.toFixed(2)})`).join('\n')
-    : 'No unused resources found. Thanks...';
+    : 'No unused resources found. This is a test email.';
 
   const mailOptions = {
     from: `AWS Resource Monitor <${emailUser}>`,
@@ -167,8 +168,8 @@ async function fetchServiceResources(service, region) {
       const ec2Client = new EC2Client({ region, credentials });
       const reservations = await paginateDescribe(ec2Client, DescribeInstancesCommand, {}, 'Reservations');
       resources = reservations.flatMap(res => res.Instances || []).map(inst => ({
-        service, // Add service
-        region,  // Add region
+        service,
+        region,
         id: inst.InstanceId,
         type: inst.InstanceType,
         state: inst.State.Name,
@@ -215,8 +216,8 @@ async function fetchServiceResources(service, region) {
         const monthlyCost = vol.Size * pricePerGb;
         totalCostEstimate += monthlyCost;
         return {
-          service, // Add service
-          region,  // Add region
+          service,
+          region,
           id: vol.VolumeId,
           type: vol.VolumeType,
           state: vol.State,
@@ -255,8 +256,8 @@ async function fetchServiceResources(service, region) {
         const monthlyCost = sizeGB * 0.023;
 
         resources.push({
-          service, // Add service
-          region,  // Add region
+          service,
+          region,
           name: bucket.Name,
           created: bucket.CreationDate,
           numObjects,
@@ -273,8 +274,8 @@ async function fetchServiceResources(service, region) {
       const rdsClient = new RDSClient({ region, credentials });
       const dbInstances = await paginateDescribe(rdsClient, DescribeDBInstancesCommand, {}, 'DBInstances');
       resources = dbInstances.map(db => ({
-        service, // Add service
-        region,  // Add region
+        service,
+        region,
         id: db.DBInstanceIdentifier,
         type: db.DBInstanceClass,
         engine: db.Engine,
@@ -315,8 +316,8 @@ async function fetchServiceResources(service, region) {
       const lambdaClient = new LambdaClient({ region, credentials });
       const functions = await paginateDescribe(lambdaClient, ListFunctionsCommand, {}, 'Functions');
       resources = functions.map(fn => ({
-        service, // Add service
-        region,  // Add region
+        service,
+        region,
         name: fn.FunctionName,
         runtime: fn.Runtime,
         memory: fn.MemorySize,
@@ -645,10 +646,14 @@ app.get('/api/scan', async (req, res) => {
     }
 
     lastUnusedResources = unusedResources; // Store for manual email
-    await sendNotification(longIdleResources);
+    if (longIdleResources.length > 0) {
+      await sendNotification(longIdleResources);
+    } else {
+      console.log('No long-idle resources found; skipping automatic email');
+    }
     res.json({ unusedResources });
   } catch (err) {
-    console.error(err);
+    console.error('Error scanning resources:', err);
     res.status(500).json({ error: err.message || 'Failed to scan resources' });
   }
 });
@@ -661,6 +666,270 @@ app.get('/api/send-email', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message || 'Failed to send email' });
   }
+});
+
+// Schedule daily scan at midnight IST
+cron.schedule('0 0 * * *', async () => {
+  console.log('Running scheduled scan for unused resources at', new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
+  try {
+    const regions = await getAllRegions();
+    const services = ['ec2', 'ebs', 's3', 'rds', 'lambda'];
+    let unusedResources = [];
+    let longIdleResources = [];
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    for (let region of regions) {
+      for (let service of services) {
+        let resources = [];
+        let cwRegion = region;
+        if (service === 's3') cwRegion = 'us-east-1';
+
+        const cwClient = new CloudWatchClient({ region: cwRegion, credentials });
+
+        switch (service) {
+          case 'ec2': {
+            const ec2Client = new EC2Client({ region, credentials });
+            const reservations = await paginateDescribe(ec2Client, DescribeInstancesCommand, {}, 'Reservations');
+            resources = reservations.flatMap(res => res.Instances || []).map(inst => ({
+              service,
+              region,
+              id: inst.InstanceId,
+              type: inst.InstanceType,
+              state: inst.State.Name,
+              creation: inst.LaunchTime,
+              avgCpu: 0,
+              usageStatus: inst.State.Name,
+              monthlyCost: 0
+            }));
+
+            for (let inst of resources) {
+              let longMetric = 0;
+              if (inst.state === 'running') {
+                inst.avgCpu = await getMetric(cwClient, 'AWS/EC2', 'CPUUtilization', [{ Name: 'InstanceId', Value: inst.id }], 'Average', 1);
+                if (inst.avgCpu < 1) inst.usageStatus = 'idle';
+                else if (inst.avgCpu < 10) inst.usageStatus = 'underutilized';
+                else inst.usageStatus = 'used';
+
+                const location = regionToLocation[region] || '';
+                if (location && inst.usageStatus !== 'stopped') {
+                  const filters = [
+                    { Type: 'TERM_MATCH', Field: 'instanceType', Value: inst.type },
+                    { Type: 'TERM_MATCH', Field: 'operatingSystem', Value: 'Linux' },
+                    { Type: 'TERM_MATCH', Field: 'tenancy', Value: 'Shared' },
+                    { Type: 'TERM_MATCH', Field: 'capacitystatus', Value: 'Used' },
+                    { Type: 'TERM_MATCH', Field: 'preInstalledSw', Value: 'NA' },
+                    { Type: 'TERM_MATCH', Field: 'location', Value: location }
+                  ];
+                  const hourly = await getHourlyPrice('AmazonEC2', filters);
+                  inst.monthlyCost = hourly * 730;
+                }
+
+                longMetric = await getMetric(cwClient, 'AWS/EC2', 'CPUUtilization', [{ Name: 'InstanceId', Value: inst.id }], 'Average', 30);
+              } else if (inst.state === 'stopped') {
+                inst.usageStatus = 'stopped';
+                inst.monthlyCost = 0;
+              }
+
+              if (inst.usageStatus !== 'used') {
+                unusedResources.push({ service, region, ...inst });
+              }
+
+              if (inst.creation < thirtyDaysAgo && 
+                  (inst.state === 'stopped' || (inst.state === 'running' && longMetric < 1))) {
+                longIdleResources.push({ service, region, ...inst });
+              }
+            }
+            break;
+          }
+          case 'ebs': {
+            const ec2Client = new EC2Client({ region, credentials });
+            const volumes = await paginateDescribe(ec2Client, DescribeVolumesCommand, {}, 'Volumes');
+            const typePrices = { gp2: 0.10, gp3: 0.08, io1: 0.125, st1: 0.045, sc1: 0.025 };
+            resources = volumes.map(vol => {
+              const pricePerGb = typePrices[vol.VolumeType] || 0.10;
+              const monthlyCost = vol.Size * pricePerGb;
+              return {
+                service,
+                region,
+                id: vol.VolumeId,
+                type: vol.VolumeType,
+                state: vol.State,
+                size: vol.Size,
+                creation: vol.CreateTime,
+                usageStatus: vol.State === 'in-use' ? 'used' : 'idle',
+                monthlyCost
+              };
+            });
+
+            for (let vol of resources) {
+              if (vol.usageStatus !== 'used') {
+                unusedResources.push({ service, region, ...vol });
+              }
+
+              if (vol.creation < thirtyDaysAgo && vol.state === 'available') {
+                longIdleResources.push({ service, region, ...vol });
+              }
+            }
+            break;
+          }
+          case 's3': {
+            const s3Client = new S3Client({ region: 'us-east-1', credentials });
+            const buckets = (await s3Client.send(new ListBucketsCommand({}))).Buckets || [];
+            for (let bucket of buckets) {
+              let locRes;
+              try {
+                locRes = await s3Client.send(new GetBucketLocationCommand({ Bucket: bucket.Name }));
+              } catch (err) {
+                continue;
+              }
+              const bucketRegion = locRes.LocationConstraint || 'us-east-1';
+              if (bucketRegion !== region) continue;
+
+              const numObjects = await getMetric(cwClient, 'AWS/S3', 'NumberOfObjects', [
+                { Name: 'BucketName', Value: bucket.Name },
+                { Name: 'StorageType', Value: 'AllStorageTypes' }
+              ], 'Average', 1);
+              const sizeBytes = await getMetric(cwClient, 'AWS/S3', 'BucketSizeBytes', [
+                { Name: 'BucketName', Value: bucket.Name },
+                { Name: 'StorageType', Value: 'StandardStorage' }
+              ], 'Average', 1);
+              const sizeGB = sizeBytes / (1024 ** 3);
+              const usageStatus = numObjects > 0 ? 'used' : 'idle';
+              const monthlyCost = sizeGB * 0.023;
+
+              const resource = {
+                service,
+                region,
+                name: bucket.Name,
+                creation: bucket.CreationDate,
+                numObjects,
+                sizeGB,
+                usageStatus,
+                monthlyCost
+              };
+              if (usageStatus !== 'used') {
+                unusedResources.push({ service, region, ...resource });
+              }
+
+              const longNumObjects = await getMetric(cwClient, 'AWS/S3', 'NumberOfObjects', [
+                { Name: 'BucketName', Value: bucket.Name },
+                { Name: 'StorageType', Value: 'AllStorageTypes' }
+              ], 'Average', 30);
+              if (resource.creation < thirtyDaysAgo && longNumObjects === 0) {
+                longIdleResources.push({ service, region, ...resource });
+              }
+            }
+            break;
+          }
+          case 'rds': {
+            const rdsClient = new RDSClient({ region, credentials });
+            const dbInstances = await paginateDescribe(rdsClient, DescribeDBInstancesCommand, {}, 'DBInstances');
+            resources = dbInstances.map(db => ({
+              service,
+              region,
+              id: db.DBInstanceIdentifier,
+              type: db.DBInstanceClass,
+              engine: db.Engine,
+              state: db.DBInstanceStatus,
+              creation: db.InstanceCreateTime,
+              avgCpu: 0,
+              usageStatus: db.DBInstanceStatus,
+              monthlyCost: 0
+            }));
+
+            for (let db of resources) {
+              let longMetric = 0;
+              if (db.state === 'available') {
+                db.avgCpu = await getMetric(cwClient, 'AWS/RDS', 'CPUUtilization', [{ Name: 'DBInstanceIdentifier', Value: db.id }], 'Average', 1);
+                if (db.avgCpu < 1) db.usageStatus = 'idle';
+                else if (db.avgCpu < 10) db.usageStatus = 'underutilized';
+                else db.usageStatus = 'used';
+
+                const location = regionToLocation[region] || '';
+                if (location) {
+                  const filters = [
+                    { Type: 'TERM_MATCH', Field: 'instanceType', Value: db.type },
+                    { Type: 'TERM_MATCH', Field: 'databaseEngine', Value: db.engine.charAt(0).toUpperCase() + db.engine.slice(1) },
+                    { Type: 'TERM_MATCH', Field: 'deploymentOption', Value: 'Single-AZ' },
+                    { Type: 'TERM_MATCH', Field: 'location', Value: location }
+                  ];
+                  const hourly = await getHourlyPrice('AmazonRDS', filters);
+                  db.monthlyCost = hourly * 730;
+                }
+
+                longMetric = await getMetric(cwClient, 'AWS/RDS', 'CPUUtilization', [{ Name: 'DBInstanceIdentifier', Value: db.id }], 'Average', 30);
+              } else if (db.state === 'stopped') {
+                db.usageStatus = 'stopped';
+                db.monthlyCost = 0;
+              }
+
+              if (db.usageStatus !== 'used') {
+                unusedResources.push({ service, region, ...db });
+              }
+
+              if (db.creation < thirtyDaysAgo && 
+                  (db.state === 'stopped' || (db.state === 'available' && longMetric < 1))) {
+                longIdleResources.push({ service, region, ...db });
+              }
+            }
+            break;
+          }
+          case 'lambda': {
+            const lambdaClient = new LambdaClient({ region, credentials });
+            const functions = await paginateDescribe(lambdaClient, ListFunctionsCommand, {}, 'Functions');
+            resources = functions.map(fn => ({
+              service,
+              region,
+              name: fn.FunctionName,
+              runtime: fn.Runtime,
+              memory: fn.MemorySize,
+              creation: new Date(fn.LastModified),
+              invocations: 0,
+              usageStatus: 'idle',
+              monthlyCost: 0
+            }));
+
+            for (let fn of resources) {
+              const invocations = await getMetric(cwClient, 'AWS/Lambda', 'Invocations', [{ Name: 'FunctionName', Value: fn.name }], 'Sum', 1);
+              fn.invocations = invocations;
+              fn.usageStatus = invocations > 0 ? 'used' : 'idle';
+
+              if (invocations > 0) {
+                const avgDuration = await getMetric(cwClient, 'AWS/Lambda', 'Duration', [{ Name: 'FunctionName', Value: fn.name }], 'Average', 1);
+                const totalDurationS = (avgDuration / 1000) * invocations;
+                const gbS = totalDurationS * (fn.memory / 1024);
+                const reqCost = invocations * 0.0000002;
+                const computeCost = gbS * 0.0000166667;
+                fn.monthlyCost = (reqCost + computeCost) * 30;
+              }
+
+              if (fn.usageStatus !== 'used') {
+                unusedResources.push({ service, region, ...fn });
+              }
+
+              const longInvocations = await getMetric(cwClient, 'AWS/Lambda', 'Invocations', [{ Name: 'FunctionName', Value: fn.name }], 'Sum', 30);
+              if (fn.creation < thirtyDaysAgo && longInvocations === 0) {
+                longIdleResources.push({ service, region, ...fn });
+              }
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    lastUnusedResources = unusedResources; // Store for manual email
+    if (longIdleResources.length > 0) {
+      await sendNotification(longIdleResources);
+      console.log('Scheduled scan: Email sent for', longIdleResources.length, 'long-idle resources');
+    } else {
+      console.log('Scheduled scan: No long-idle resources found; skipping email');
+    }
+  } catch (err) {
+    console.error('Scheduled scan error:', err);
+  }
+}, {
+  timezone: 'Asia/Kolkata' // IST timezone
 });
 
 app.listen(port, () => {
