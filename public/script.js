@@ -26,6 +26,7 @@ async function fetchRegions() {
     const response = await fetch('/api/regions');
     const regions = await response.json();
     const regionSelect = document.getElementById('regionSelect');
+    regionSelect.innerHTML = '<option value="all">All</option>';
     regions.forEach(region => {
       const option = document.createElement('option');
       option.value = region;
@@ -39,7 +40,7 @@ async function fetchRegions() {
   }
 }
 
-async function fetchResources() {
+async function fetchResources(forceRefresh = false) {
   toggleLoading(true);
   const service = document.getElementById('serviceSelect').value;
   const region = document.getElementById('regionSelect').value;
@@ -50,6 +51,10 @@ async function fetchResources() {
     url += 'all/all';
   } else {
     url += `${service}/${region}`;
+  }
+  
+  if (forceRefresh) {
+    url += '?refresh=true';
   }
 
   try {
@@ -63,11 +68,50 @@ async function fetchResources() {
     updateTable(resources);
     updateSummary(data.resources, data.totalCostEstimate);
     updateChart(resources);
+    
+    // Show cache hit indicator
+    if (!forceRefresh && data.fromCache) {
+      showToast('Data loaded from cache', 'info');
+    }
   } catch (err) {
     console.error('Error fetching resources:', err);
+    showToast('Error fetching resources: ' + err.message, 'danger');
   } finally {
     toggleLoading(false);
   }
+}
+
+// Toast notification function
+function showToast(message, type = 'info') {
+  const toastContainer = document.getElementById('toast-container');
+  if (!toastContainer) {
+    const container = document.createElement('div');
+    container.id = 'toast-container';
+    container.className = 'position-fixed bottom-0 end-0 p-3';
+    container.style.zIndex = '11';
+    document.body.appendChild(container);
+  }
+  
+  const toastEl = document.createElement('div');
+  toastEl.className = `toast align-items-center text-white bg-${type} border-0`;
+  toastEl.setAttribute('role', 'alert');
+  toastEl.setAttribute('aria-live', 'assertive');
+  toastEl.setAttribute('aria-atomic', 'true');
+  
+  toastEl.innerHTML = `
+    <div class="d-flex">
+      <div class="toast-body">
+        ${message}
+      </div>
+      <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+    </div>
+  `;
+  
+  document.getElementById('toast-container').appendChild(toastEl);
+  const toast = new bootstrap.Toast(toastEl);
+  toast.show();
+  
+  toastEl.addEventListener('hidden.bs.toast', () => toastEl.remove());
 }
 
 // Incremental table update to reduce flickering
@@ -81,7 +125,7 @@ function updateTable(resources) {
     const key = row.dataset.key;
     if (!resourceKeys.includes(key)) {
       row.style.opacity = '0';
-      setTimeout(() => row.remove(), 200); // Fade out
+      setTimeout(() => row.remove(), 200);
     }
   });
 
@@ -94,7 +138,7 @@ function updateTable(resources) {
       row.dataset.key = key;
       row.style.opacity = '0';
       tbody.appendChild(row);
-      setTimeout(() => { row.style.opacity = '1'; }, 10); // Fade in
+      setTimeout(() => { row.style.opacity = '1'; }, 10);
     }
     row.innerHTML = `
       <td>${r.service || ''}</td>
@@ -116,8 +160,10 @@ async function scanUnused() {
     const data = await response.json();
     lastUnusedResources = data.unusedResources || [];
     updateUnusedTable(lastUnusedResources);
+    showToast(`Found ${lastUnusedResources.length} unused resources`, 'info');
   } catch (err) {
     console.error('Error scanning unused resources:', err);
+    showToast('Error scanning resources: ' + err.message, 'danger');
   } finally {
     toggleLoading(false);
   }
@@ -128,9 +174,48 @@ async function sendEmail() {
   try {
     const response = await fetch('/api/send-email');
     const result = await response.json();
-    alert(result.message || 'Email sent successfully');
+    showToast(result.message || 'Email sent successfully', 'success');
   } catch (err) {
-    alert('Error sending email: ' + err.message);
+    showToast('Error sending email: ' + err.message, 'danger');
+  } finally {
+    toggleLoading(false);
+  }
+}
+
+async function clearCache() {
+  if (confirm('Clear all cached data? This will force a fresh fetch from AWS on next load.')) {
+    toggleLoading(true);
+    try {
+      const response = await fetch('/api/clear-cache', { method: 'POST' });
+      const result = await response.json();
+      showToast(result.message, 'success');
+      // Refresh the current view
+      await fetchResources(false);
+    } catch (err) {
+      console.error('Error clearing cache:', err);
+      showToast('Error clearing cache: ' + err.message, 'danger');
+    } finally {
+      toggleLoading(false);
+    }
+  }
+}
+
+async function forceRefresh() {
+  showToast('Force refreshing data from AWS (bypassing cache)...', 'info');
+  await fetchResources(true);
+  showToast('Data refreshed successfully!', 'success');
+}
+
+async function viewCacheStats() {
+  toggleLoading(true);
+  try {
+    const response = await fetch('/api/cache-stats');
+    const stats = await response.json();
+    const statsMessage = `Total cached items: ${stats.totalKeys}\nRecent keys:\n${stats.keys.join('\n')}`;
+    alert(statsMessage);
+  } catch (err) {
+    console.error('Error fetching cache stats:', err);
+    showToast('Error fetching cache stats: ' + err.message, 'danger');
   } finally {
     toggleLoading(false);
   }
@@ -141,16 +226,14 @@ function updateUnusedTable(resources) {
   const existingRows = Array.from(tbody.querySelectorAll('tr'));
   const resourceKeys = resources.map(r => `${r.service}-${r.region}-${r.id || r.name}`);
 
-  // Remove rows for resources no longer present
   existingRows.forEach(row => {
     const key = row.dataset.key;
     if (!resourceKeys.includes(key)) {
       row.style.opacity = '0';
-      setTimeout(() => row.remove(), 200); // Fade out
+      setTimeout(() => row.remove(), 200);
     }
   });
 
-  // Add or update rows
   resources.forEach(r => {
     const key = `${r.service}-${r.region}-${r.id || r.name}`;
     let row = tbody.querySelector(`tr[data-key="${key}"]`);
@@ -159,7 +242,7 @@ function updateUnusedTable(resources) {
       row.dataset.key = key;
       row.style.opacity = '0';
       tbody.appendChild(row);
-      setTimeout(() => { row.style.opacity = '1'; }, 10); // Fade in
+      setTimeout(() => { row.style.opacity = '1'; }, 10);
     }
     row.innerHTML = `
       <td>${r.service}</td>
@@ -196,7 +279,6 @@ function updateChart(resources) {
   };
 
   if (chartInstance) {
-    // Update existing chart data
     chartInstance.data.datasets[0].data = [
       statusCounts.running,
       statusCounts.stopped,
@@ -204,7 +286,7 @@ function updateChart(resources) {
       statusCounts.underutilized,
       statusCounts.used
     ];
-    chartInstance.update('none'); // Silent update
+    chartInstance.update('none');
   } else {
     chartInstance = new Chart(ctx, {
       type: 'pie',
@@ -217,8 +299,8 @@ function updateChart(resources) {
       },
       options: {
         responsive: true,
-        maintainAspectRatio: false, // Allow fixed height
-        animation: false // Disable animations
+        maintainAspectRatio: false,
+        animation: false
       }
     });
   }
@@ -233,23 +315,28 @@ function exportToCSV() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = 'resources.csv';
+  a.download = `aws-resources-${new Date().toISOString().slice(0,19)}.csv`;
   a.click();
   URL.revokeObjectURL(url);
+  showToast('CSV exported successfully', 'success');
 }
 
 // Debounced fetchResources
-const debouncedFetchResources = debounce(fetchResources, 500);
+const debouncedFetchResources = debounce(() => fetchResources(false), 500);
 
 // Event listeners
-document.getElementById('refreshBtn').addEventListener('click', debouncedFetchResources);
+document.getElementById('refreshBtn').addEventListener('click', () => fetchResources(false));
 document.getElementById('scanBtn').addEventListener('click', scanUnused);
 document.getElementById('sendEmailBtn').addEventListener('click', sendEmail);
 document.getElementById('exportBtn').addEventListener('click', exportToCSV);
 document.getElementById('serviceSelect').addEventListener('change', debouncedFetchResources);
 document.getElementById('regionSelect').addEventListener('change', debouncedFetchResources);
 document.getElementById('statusSelect').addEventListener('change', debouncedFetchResources);
+document.getElementById('clearCacheBtn').addEventListener('click', clearCache);
+document.getElementById('refreshForceBtn').addEventListener('click', forceRefresh);
+document.getElementById('viewCacheStatsBtn').addEventListener('click', viewCacheStats);
 
+// Initialize
 fetchRegions();
-debouncedFetchResources();
-setInterval(debouncedFetchResources, 5 * 60 * 1000);
+fetchResources(false);
+setInterval(() => fetchResources(false), 5 * 60 * 1000);

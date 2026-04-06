@@ -3,13 +3,18 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AWS Resource Monitor</title>
+  <title>AWS Resource Monitor with Redis Cache</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div class="container">
     <h1 class="my-4 text-center">AWS Resource Monitor</h1>
+
+    <!-- Cache Status Badge -->
+    <div class="text-center mb-3">
+      <span class="badge bg-info" id="cacheStatus">Redis Cache Enabled</span>
+    </div>
 
     <!-- Filters -->
     <div class="row mb-4">
@@ -47,11 +52,21 @@
       </div>
     </div>
 
+    <!-- Cache Control Buttons -->
+    <div class="row mb-3">
+      <div class="col-12">
+        <button id="clearCacheBtn" class="btn btn-info me-2">Clear Cache</button>
+        <button id="refreshForceBtn" class="btn btn-danger me-2">Force Refresh (Skip Cache)</button>
+        <button id="viewCacheStatsBtn" class="btn btn-dark">View Cache Stats</button>
+      </div>
+    </div>
+
     <!-- Loading Spinner -->
     <div id="loading" class="text-center d-none">
       <div class="spinner-border" role="status">
         <span class="visually-hidden">Loading...</span>
       </div>
+      <p class="mt-2">Fetching data from AWS...</p>
     </div>
 
     <!-- Summary Cards -->
@@ -104,10 +119,10 @@
             <th>Usage Status</th>
             <th>Avg CPU (%)</th>
             <th>Monthly Cost ($)</th>
-          </tr>
+           </tr>
         </thead>
         <tbody id="resourcesTable"></tbody>
-      </table>
+       </table>
     </div>
 
     <!-- Unused Resources Table -->
@@ -124,10 +139,10 @@
             <th>Usage Status</th>
             <th>Avg CPU (%)</th>
             <th>Monthly Cost ($)</th>
-          </tr>
+           </tr>
         </thead>
         <tbody id="unusedResourcesTable"></tbody>
-      </table>
+       </table>
     </div>
     <button id="scanBtn" class="btn btn-warning mt-2 me-2">Scan Unused</button>
     <button id="sendEmailBtn" class="btn btn-success mt-2">Send Email</button>
