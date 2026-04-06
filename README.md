@@ -221,5 +221,18 @@ Check server logs for AWS SDK errors.
 
 
 
-Portfolio: www.subhashcloud.in
-Contact: Reach out via LinkedIn or email.
+.env file 
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+EMAIL_USER=
+EMAIL_PASS=
+RECEIVER_EMAIL=
+PORT=3000
+
+# Redis Configuration
+REDIS_URL=redis://localhost:6379
+REDIS_PASSWORD=
+
+
+
+
